@@ -9,11 +9,18 @@ from transformers import AutoTokenizer
 import tiktoken
 import torch.multiprocessing as mp
 
+// avoid RuntimeError: An attempt has been made to start a new process before the current process has finished its bootstrapping phase.
+// Python 3.14 uses forkserver as default method, which causes TypeError: cannot pickle 'TextIOWrapper' instances when using multiprocessing with file handles. So we set the start method to fork to avoid this issue.
+mp.set_start_method("fork", force=True)
+
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 model_map = json.loads(open('config/model2path.json', encoding='utf-8').read())
 maxlen_map = json.loads(open('config/model2maxlen.json', encoding='utf-8').read())
 
-URL = "http://127.0.0.1:8000/v1"
-API_KEY = "token-abc123"
+URL = "https://openrouter.ai/api/v1"
+API_KEY = os.environ["OPENROUTER_API_KEY"]
 template_rag = open('prompts/0shot_rag.txt', encoding='utf-8').read()
 template_no_context = open('prompts/0shot_no_context.txt', encoding='utf-8').read()
 template_0shot = open('prompts/0shot.txt', encoding='utf-8').read()
@@ -43,7 +50,7 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
-                max_tokens=max_new_tokens,
+                max_tokens=max(max_new_tokens, 2048),
             )
             return completion.choices[0].message.content
         except KeyboardInterrupt as e:
@@ -72,7 +79,7 @@ def get_pred(data, args, fout):
     if "gpt" in model or "o1" in model:
         tokenizer = tiktoken.encoding_for_model("gpt-4o-2024-08-06")
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_map[model], trust_remote_code=True)
+        tokenizer = tiktoken.get_encoding("cl100k_base")
     client = OpenAI(
         base_url=URL,
         api_key=API_KEY
