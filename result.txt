@@ -1,2 +1,2 @@
-Model	Overall	Easy	Hard	Short	Medium	Long
-glm-5.3-flash	67.6	69.0	66.7	66.7	71.2	61.0
+Model	Overall	Easy	Hard	Short	Medium	Long	Provider	Requests	Cost($)	Infer(s)	Infer/q(s)	PromptTok	ReasonTok	CompTok	TotalTok	$/1M tok
+glm-5.3-flash	67.6	69.0	66.7	66.7	71.2	61.0	-	-	-	-	-	-	-	-	-	-

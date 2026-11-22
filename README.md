@@ -83,10 +83,15 @@ python pred.py --model GLM-4-9B-Chat
 - `--cot`: Enable evaluation under the Chain-of-Thought (CoT) setting.
 - `--no_context`: Test the model’s performance without the long context (pure memorization).
 - `--rag N`: Use top-N retrieved contexts during +RAG evaluation. This is set to 0 by default to disable RAG. For details on the retrieval process, refer to the [retrieve.py](https://github.com/THUDM/LongCite/blob/main/utils/retrieve.py) file.
+- `--skip_gen_stats`: Skip the OpenRouter generation lookup. Cost and token counts still come inline with each completion, but the provider that served the request, its provider-side latency and the native token counts are not recorded.
+
+Every answer is stored with a `metrics` block recording what the API call cost: wall-clock inference time, credits spent, prompt / reasoning / completion / total tokens, and one entry per API call (retries and the extra CoT answer-extraction call included). Alongside the inline usage accounting, each call is looked up in [OpenRouter's generation history](https://openrouter.ai/docs/client-sdks/python/sdks/generations/README#getgeneration) — the same record the activity dashboard shows — for the provider name, provider-side latency and native token counts. The lookup uses the official `openrouter` SDK when installed and a plain `GET /api/v1/generation` otherwise.
+
+`python misc/test_metrics.py` exercises the whole usage-accounting path against stubbed API responses, so it needs neither an API key nor network access.
 
 #### Step 3: Export Results
 
-Finally, run `python result.py` to export the evaluation results.
+Finally, run `python result.py` to export the evaluation results. It prints an accuracy table (Overall / Easy / Hard / Short / Medium / Long) and a usage table (provider, API requests, cost in USD, total and per-question inference time, prompt / reasoning / completion / total tokens, and the effective $ per 1M tokens), and writes both as one wide TSV row per model to `result.txt`. Runs predating usage accounting still score normally and show `-` in the usage columns.
 
 ## 📝 Citation
 ```

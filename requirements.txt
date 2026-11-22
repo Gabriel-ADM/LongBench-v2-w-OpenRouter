@@ -3,7 +3,9 @@ datasets
 fuzzywuzzy
 jieba
 openai
+openrouter
 python-dotenv
+requests
 python-Levenshtein
 rouge
 tiktoken

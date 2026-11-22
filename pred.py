@@ -20,6 +20,7 @@ model_map = json.loads(open('config/model2path.json', encoding='utf-8').read())
 maxlen_map = json.loads(open('config/model2maxlen.json', encoding='utf-8').read())
 
 URL = "https://openrouter.ai/api/v1"
+GENERATION_URL = "https://openrouter.ai/api/v1/generation"
 API_KEY = os.environ["OPENROUTER_API_KEY"]
 template_rag = open('prompts/0shot_rag.txt', encoding='utf-8').read()
 template_no_context = open('prompts/0shot_no_context.txt', encoding='utf-8').read()
@@ -27,7 +28,166 @@ template_0shot = open('prompts/0shot.txt', encoding='utf-8').read()
 template_0shot_cot = open('prompts/0shot_cot.txt', encoding='utf-8').read()
 template_0shot_cot_ans = open('prompts/0shot_cot_ans.txt', encoding='utf-8').read()
 
-def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_tokens=128, stop=None):
+def usage_from_completion(completion):
+    """Pull OpenRouter's usage accounting off a chat completion.
+
+    OpenRouter adds non-standard fields (`cost`, `cost_details`) to `usage`. The OpenAI SDK
+    keeps them because its pydantic models allow extras, so dump the whole completion and
+    read the resulting dict instead of touching attributes that may not exist.
+    """
+    try:
+        data = completion.model_dump()
+    except Exception:
+        return {}
+    usage = data.get('usage') or {}
+    prompt_details = usage.get('prompt_tokens_details') or {}
+    completion_details = usage.get('completion_tokens_details') or {}
+    cost_details = usage.get('cost_details') or {}
+    prompt_tokens = usage.get('prompt_tokens') or 0
+    completion_tokens = usage.get('completion_tokens') or 0
+    return {
+        'generation_id': data.get('id'),
+        'model': data.get('model'),
+        'cost': usage.get('cost') or 0.0,
+        'upstream_inference_cost': cost_details.get('upstream_inference_cost') or 0.0,
+        'prompt_tokens': prompt_tokens,
+        'cached_tokens': prompt_details.get('cached_tokens') or 0,
+        'completion_tokens': completion_tokens,
+        'reasoning_tokens': completion_details.get('reasoning_tokens') or 0,
+        'total_tokens': usage.get('total_tokens') or (prompt_tokens + completion_tokens),
+    }
+
+# Field names of components.GenerationResponseData, mapped to the names we store. Times are
+# documented as milliseconds, so they get a _ms suffix here.
+GENERATION_FIELDS = {
+    'provider_name': 'provider_name',
+    'latency': 'latency_ms',
+    'generation_time': 'generation_time_ms',
+    'moderation_latency': 'moderation_latency_ms',
+    'tokens_prompt': 'tokens_prompt',
+    'tokens_completion': 'tokens_completion',
+    'native_tokens_prompt': 'native_tokens_prompt',
+    'native_tokens_completion': 'native_tokens_completion',
+    'native_tokens_reasoning': 'native_tokens_reasoning',
+    'native_tokens_cached': 'native_tokens_cached',
+    'total_cost': 'total_cost',
+    'cache_discount': 'cache_discount',
+    'finish_reason': 'finish_reason',
+    'native_finish_reason': 'native_finish_reason',
+    'streamed': 'streamed',
+}
+
+class GenerationStats:
+    """Reads the OpenRouter activity-log record for a generation.
+
+    This is the same row the OpenRouter dashboard shows, and the only place that carries the
+    provider that served the request, its provider-side latency and the native token counts.
+    Uses the official `openrouter` SDK when it is installed and falls back to a plain GET on
+    /api/v1/generation otherwise, so a run never hard-depends on the extra package.
+    """
+
+    def __init__(self, api_key, retries=3):
+        self.api_key = api_key
+        self.retries = retries
+        self.client = None
+        self.session = None
+        try:
+            from openrouter import OpenRouter
+            self.client = OpenRouter(api_key=api_key)
+        except Exception:
+            try:
+                import requests
+                self.session = requests.Session()
+            except Exception:
+                # Neither backend available: the lookup turns into a no-op rather than
+                # taking the run down over an optional metric.
+                print("No OpenRouter SDK or requests available; skipping generation stats.")
+
+    def close(self):
+        for backend in (self.client, self.session):
+            try:
+                backend.close()
+            except Exception:
+                pass
+
+    def fetch(self, generation_id):
+        """Return the normalized record, or {} if it never showed up. Never raises."""
+        if not generation_id:
+            return {}
+        delay = 0.5
+        for attempt in range(self.retries + 1):
+            record, pending = self._fetch_once(generation_id)
+            if record:
+                return {dest: record[src] for src, dest in GENERATION_FIELDS.items()
+                        if record.get(src) is not None}
+            # The record is written a moment after the completion returns, so a 404 right
+            # after the call just means "not indexed yet" and is worth another look.
+            if not pending or attempt == self.retries:
+                return {}
+            time.sleep(delay)
+            delay *= 2
+        return {}
+
+    def _fetch_once(self, generation_id):
+        """-> (record dict or None, whether it is worth retrying)"""
+        if self.client is None and self.session is None:
+            return None, False
+        if self.client is not None:
+            try:
+                res = self.client.generations.get_generation(id=generation_id)
+            except Exception as e:
+                return None, 'notfound' in type(e).__name__.lower()
+            try:
+                raw = res.model_dump()
+            except Exception:
+                raw = res if isinstance(res, dict) else {}
+        else:
+            try:
+                resp = self.session.get(
+                    GENERATION_URL,
+                    params={'id': generation_id},
+                    headers={'Authorization': 'Bearer %s' % self.api_key},
+                    timeout=30,
+                )
+            except Exception:
+                return None, False
+            if resp.status_code == 404:
+                return None, True
+            if resp.status_code >= 400:
+                return None, False
+            try:
+                raw = resp.json()
+            except Exception:
+                return None, False
+        if not isinstance(raw, dict):
+            return None, False
+        return (raw.get('data') or raw), False
+
+def summarize_calls(calls):
+    """Roll the per-call records of one question up into the item's usage block."""
+    def total(key):
+        return sum(call.get(key) or 0 for call in calls)
+    providers = []
+    for call in calls:
+        provider = call.get('provider_name')
+        if provider and provider not in providers:
+            providers.append(provider)
+    return {
+        'requests': len(calls),
+        'failed_requests': sum(1 for call in calls if not call.get('ok')),
+        'inference_time': round(total('inference_time'), 3),
+        'generation_time_ms': round(total('generation_time_ms'), 1),
+        'cost': total('cost'),
+        'prompt_tokens': total('prompt_tokens'),
+        'cached_tokens': total('cached_tokens'),
+        'reasoning_tokens': total('reasoning_tokens'),
+        'completion_tokens': total('completion_tokens'),
+        'total_tokens': total('total_tokens'),
+        'providers': providers,
+        'calls': calls,
+    }
+
+def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_tokens=128, stop=None, gen_stats=None):
     # truncate
     max_len = maxlen_map[model]
     if model in model_map:
@@ -41,10 +201,13 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
             input_ids = input_ids[:max_len//2] + input_ids[-max_len//2:]
             prompt = tokenizer.decode(input_ids)
     tries = 0
+    calls = []  # one record per attempt, so retries are counted and their cost is not lost
     if model in model_map:
         model = model_map[model]
     while tries < 5:
         tries += 1
+        completion = None
+        started = time.perf_counter()
         try:
             completion = client.chat.completions.create(
                 model=model,
@@ -52,15 +215,29 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
                 temperature=temperature,
                 max_tokens=max(max_new_tokens, 2048),
             )
-            return completion.choices[0].message.content
+            # Inference time is the wall clock of the model call only, measured before any
+            # usage bookkeeping below.
+            inference_time = time.perf_counter() - started
+            content = completion.choices[0].message.content or ''
         except KeyboardInterrupt as e:
             raise e
         except Exception as e:
+            call = {'attempt': tries, 'ok': False, 'error': str(e),
+                    'inference_time': time.perf_counter() - started}
+            call.update(usage_from_completion(completion) if completion is not None else {})
+            calls.append(call)
             print("Error Occurs: \"%s\"        Retry ..."%(str(e)))
             time.sleep(1)
+            continue
+        call = {'attempt': tries, 'ok': True, 'error': None, 'inference_time': inference_time}
+        call.update(usage_from_completion(completion))
+        if gen_stats is not None:
+            call.update(gen_stats.fetch(call.get('generation_id')))
+        calls.append(call)
+        return content, calls
     else:
         print("Max tries. Failed.")
-        return ''
+        return '', calls
 
 def extract_answer(response):
     response = response.replace('*', '')
@@ -84,6 +261,15 @@ def get_pred(data, args, fout):
         base_url=URL,
         api_key=API_KEY
     )
+    # One generation-stats client per worker process, so each owns its own connection pool.
+    gen_stats = None if args.skip_gen_stats else GenerationStats(API_KEY)
+    try:
+        run_pred(data, args, fout, model, tokenizer, client, gen_stats)
+    finally:
+        if gen_stats is not None:
+            gen_stats.close()
+
+def run_pred(data, args, fout, model, tokenizer, client, gen_stats):
     for item in tqdm(data):
         context = item['context']
         if args.rag > 0:
@@ -98,24 +284,30 @@ def get_pred(data, args, fout):
         else:
             template = template_0shot
         prompt = template.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip())
+        calls = []  # every API call this question needed, CoT's second pass included
         if args.cot:
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=1024)
+            output, item_calls = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=1024, gen_stats=gen_stats)
         else:
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+            output, item_calls = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128, gen_stats=gen_stats)
+        calls.extend(item_calls)
         if output == '':
+            print("No answer for %s after %d call(s), skipping (will be retried next run)." % (item['_id'], len(calls)))
             continue
         if args.cot: # extract answer
             response = output.strip()
             item['response_cot'] = response
             prompt = template_0shot_cot_ans.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip()).replace('$COT$', response)
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+            output, item_calls = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128, gen_stats=gen_stats)
+            calls.extend(item_calls)
             if output == '':
+                print("No answer for %s after %d call(s), skipping (will be retried next run)." % (item['_id'], len(calls)))
                 continue
         response = output.strip()
         item['response'] = response
         item['pred'] = extract_answer(response)
         item['judge'] = item['pred'] == item['answer']
         item['context'] = context[:1000]
+        item['metrics'] = summarize_calls(calls)
         fout.write(json.dumps(item, ensure_ascii=False) + '\n')
         fout.flush()
 
@@ -162,5 +354,6 @@ if __name__ == "__main__":
     parser.add_argument("--no_context", "-nc", action='store_true') # set to True if using no context (directly measuring memorization)
     parser.add_argument("--rag", "-rag", type=int, default=0) # set to 0 if RAG is not used, otherwise set to N when using top-N retrieved context
     parser.add_argument("--n_proc", "-n", type=int, default=16)
+    parser.add_argument("--skip_gen_stats", action='store_true') # set to True to skip the OpenRouter generation lookup (drops provider and provider-side latency, keeps cost and tokens)
     args = parser.parse_args()
     main()
