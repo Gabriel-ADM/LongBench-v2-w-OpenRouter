@@ -9,8 +9,8 @@ from transformers import AutoTokenizer
 import tiktoken
 import torch.multiprocessing as mp
 
-// avoid RuntimeError: An attempt has been made to start a new process before the current process has finished its bootstrapping phase.
-// Python 3.14 uses forkserver as default method, which causes TypeError: cannot pickle 'TextIOWrapper' instances when using multiprocessing with file handles. So we set the start method to fork to avoid this issue.
+# avoid RuntimeError: An attempt has been made to start a new process before the current process has finished its bootstrapping phase.
+# Python 3.14 uses forkserver as default method, which causes TypeError: cannot pickle 'TextIOWrapper' instances when using multiprocessing with file handles. So we set the start method to fork to avoid this issue.
 mp.set_start_method("fork", force=True)
 
 from dotenv import load_dotenv
