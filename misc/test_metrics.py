@@ -374,9 +374,19 @@ USAGE_HEADER = ["Model", "Provider", "Requests", "Cost($)", "Infer(s)", "Infer/q
                 "PromptTok", "ReasonTok", "CompTok", "TotalTok", "$/1M tok"]
 
 
+BANNER = """\
+NOTE: every API response below is STUBBED -- no network call is made and no API key is used.
+Costs, token counts, providers and latencies printed here are literals from this file
+(FakeCompletion, GENERATION_RECORD), not values OpenRouter returned. These checks prove the
+parsing and aggregation logic, NOT that OpenRouter's live response still has these field
+names. For that, run: python misc/check_live_metrics.py
+"""
+
+
 if __name__ == '__main__':
+    print(BANNER)
     for name, test in sorted(globals().items()):
         if name.startswith('test_'):
             print('\n--- %s' % name)
             test()
-    print('\nAll metrics checks passed.')
+    print('\nAll metrics checks passed (against stubbed responses -- see the note above).')

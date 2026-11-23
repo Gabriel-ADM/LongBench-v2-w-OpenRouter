@@ -87,7 +87,7 @@ python pred.py --model GLM-4-9B-Chat
 
 Every answer is stored with a `metrics` block recording what the API call cost: wall-clock inference time, credits spent, prompt / reasoning / completion / total tokens, and one entry per API call (retries and the extra CoT answer-extraction call included). Alongside the inline usage accounting, each call is looked up in [OpenRouter's generation history](https://openrouter.ai/docs/client-sdks/python/sdks/generations/README#getgeneration) — the same record the activity dashboard shows — for the provider name, provider-side latency and native token counts. The lookup uses the official `openrouter` SDK when installed and a plain `GET /api/v1/generation` otherwise.
 
-`python misc/test_metrics.py` exercises the whole usage-accounting path against stubbed API responses, so it needs neither an API key nor network access.
+Two scripts check the usage accounting without running the benchmark. `python misc/test_metrics.py` exercises the whole path against stubbed API responses, so it needs neither an API key nor network access. `python misc/check_live_metrics.py [model]` makes one real API call with a trivial prompt — no dataset download, a fraction of a cent — and prints the resulting `metrics` block next to the raw generation record, flagging any field OpenRouter has since renamed.
 
 #### Step 3: Export Results
 
