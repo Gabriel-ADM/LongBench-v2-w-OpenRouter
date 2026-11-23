@@ -6,7 +6,8 @@ compensated = False
 
 ACCURACY_HEADER = ["Model", "Overall", "Easy", "Hard", "Short", "Medium", "Long"]
 USAGE_HEADER = ["Model", "Provider", "Requests", "Cost($)", "Infer(s)", "Infer/q(s)",
-                "PromptTok", "ReasonTok", "CompTok", "TotalTok", "$/1M tok"]
+                "Lat/q(ms)", "Gen/q(s)", "PromptTok", "ReasonTok", "CompTok", "TotalTok",
+                "$/1M tok"]
 
 
 def load_preds(filename):
@@ -74,12 +75,18 @@ def usage_row(name, pred_data):
     cost = total('cost')
     infer = total('inference_time')
     total_tok = total('total_tokens')
+    # Provider-side timings only exist when the generation lookup found the record, so they
+    # read '-' when it did not -- a real zero would hide a failed lookup.
+    latency = total('latency_ms')
+    gen_time = total('generation_time_ms')
     return [name,
             '/'.join(providers) if providers else '-',
             str(total('requests')),
             '%.4f' % cost,
             '%.1f' % infer,
             '%.1f' % (infer / len(metrics)),
+            '-' if latency == 0 else '%.0f' % (latency / len(metrics)),
+            '-' if gen_time == 0 else '%.1f' % (gen_time / len(metrics) / 1000),
             str(total('prompt_tokens')),
             str(total('reasoning_tokens')),
             str(total('completion_tokens')),

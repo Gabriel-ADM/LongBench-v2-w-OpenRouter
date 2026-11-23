@@ -95,6 +95,53 @@ GENERATION_RECORD = {
 }
 
 
+class FakeResponse:
+    """Enough of a requests.Response for the GET /api/v1/generation path."""
+
+    def __init__(self, status_code=200, payload=GENERATION_RECORD, text=None):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text if text is not None else json.dumps(payload or {})
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError('body is not JSON')
+        return self._payload
+
+
+class FakeSession:
+    """Serves canned responses in order, repeating the last one."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.requests.append((url, params, timeout))
+        response = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def close(self):
+        pass
+
+
+class BrokenSDKClient:
+    """An installed `openrouter` package that is not the SDK pred.py expects."""
+
+    def __init__(self, error=None):
+        self.error = error or AttributeError(
+            "'OpenRouter' object has no attribute 'generations'")
+        self.generations = types.SimpleNamespace(get_generation=self._raise)
+
+    def _raise(self, id=None):
+        raise self.error
+
+    def close(self):
+        pass
+
+
 class FakeGenStats(pred.GenerationStats):
     """Skips the real client construction and serves the canned record.
 
@@ -104,8 +151,13 @@ class FakeGenStats(pred.GenerationStats):
     def __init__(self, misses=0, record=GENERATION_RECORD):
         self.api_key = 'test-key'
         self.retries = 3
+        self.timeout = 30
         self.client = None
-        self.session = None
+        # Never used -- _fetch_once is overridden below -- but fetch() checks that some
+        # backend exists before it tries anything.
+        self.session = FakeSession([FakeResponse()])
+        self.last_error = None
+        self.warned = False
         self.misses = misses
         self.record = record
         self.fetches = 0
@@ -167,6 +219,63 @@ def test_generation_retry_then_give_up():
     check('no id, no fetch', FakeGenStats().fetch(None), {})
 
 
+def test_sdk_failure_falls_back_to_http():
+    """A broken `openrouter` package must not cost the run its latency numbers."""
+    stats = pred.GenerationStats('test-key')
+    stats.client = BrokenSDKClient()
+    stats.session = FakeSession([FakeResponse()])
+    record = stats.fetch('gen-abc')
+    check('latency via the HTTP fallback', record['latency_ms'], 980.0)
+    check('provider via the HTTP fallback', record['provider_name'], 'DeepInfra')
+    check('broken SDK dropped for later calls', stats.client, None)
+    url, params, timeout = stats.session.requests[0]
+    check('GET url', url, pred.GENERATION_URL)
+    check('GET params', params, {'id': 'gen-abc'})
+    check('GET timeout', timeout, 30)
+    stats.close()
+
+
+def test_lookup_errors_are_reported_not_swallowed():
+    """The reason an empty record is empty has to reach the operator."""
+    stats = pred.GenerationStats('test-key')
+    stats.client = None
+    stats.session = FakeSession([FakeResponse(
+        status_code=401, payload={'error': {'code': 401, 'message': 'No auth credentials'}})])
+    check('401 -> empty record', stats.fetch('gen-abc'), {})
+    assert '401' in stats.last_error, stats.last_error
+    assert 'No auth credentials' in stats.last_error, stats.last_error
+    print('ok   last_error = %r' % stats.last_error)
+    check('warned', stats.warned, True)
+
+    # A 200 whose body is not JSON, and a transport error, must also name themselves.
+    stats.warned, stats.session = False, FakeSession([FakeResponse(payload=None, text='<html>')])
+    check('bad body -> empty', stats.fetch('gen-abc'), {})
+    assert 'not JSON' in stats.last_error, stats.last_error
+    print('ok   last_error = %r' % stats.last_error)
+    stats.session = FakeSession([OSError('connection reset')])
+    check('transport error -> empty', stats.fetch('gen-abc'), {})
+    assert 'connection reset' in stats.last_error, stats.last_error
+    print('ok   last_error = %r' % stats.last_error)
+    stats.close()
+
+
+def test_http_404_is_retried_then_succeeds():
+    """The record lands a moment after the completion, so a 404 means 'not yet'."""
+    stats = pred.GenerationStats('test-key', retries=1)
+    stats.client = None
+    stats.session = FakeSession([FakeResponse(status_code=404, payload={}), FakeResponse()])
+    check('record after one 404', stats.fetch('gen-abc')['latency_ms'], 980.0)
+    check('GETs used', len(stats.session.requests), 2)
+    check('error cleared on success', stats.last_error, None)
+
+    stats.session = FakeSession([FakeResponse(status_code=404, payload={})])
+    check('persistent 404 -> empty', stats.fetch('gen-abc'), {})
+    assert 'not indexed yet' in stats.last_error, stats.last_error
+    print('ok   last_error = %r' % stats.last_error)
+    check('retries bounded', len(stats.session.requests), 2)
+    stats.close()
+
+
 def test_query_llm_records_each_attempt():
     tokenizer = FakeTokenizer()
     client = FakeClient(errors=2)
@@ -204,6 +313,8 @@ def test_summarize_calls():
     check('reasoning_tokens', metrics['reasoning_tokens'], 120)
     check('completion_tokens', metrics['completion_tokens'], 300)
     check('total_tokens', metrics['total_tokens'], 50300)
+    check('latency_ms', metrics['latency_ms'], 980.0)
+    check('generation_time_ms', metrics['generation_time_ms'], 11200.0)
     check('providers', metrics['providers'], ['DeepInfra'])
     check('metrics json-serializable', isinstance(json.dumps(metrics), str), True)
 
@@ -306,7 +417,8 @@ def fake_run_rows(n=12):
             'answer': 'B', 'pred': 'B' if i % 4 else 'A', 'judge': bool(i % 4),
             'metrics': {
                 'requests': 1, 'failed_requests': 0,
-                'inference_time': 10.0 + i, 'generation_time_ms': 11000.0,
+                'inference_time': 10.0 + i, 'latency_ms': 900.0,
+                'generation_time_ms': 11000.0,
                 'cost': cost, 'prompt_tokens': 50000 + i, 'cached_tokens': 0,
                 'reasoning_tokens': 120, 'completion_tokens': 300,
                 'total_tokens': 50300 + i, 'providers': [provider], 'calls': calls,
@@ -338,6 +450,13 @@ def test_result_py_aggregates():
             for row in fake_run_rows(4):
                 row.pop('metrics')
                 f.write(json.dumps(row) + '\n')
+        # A run whose generation lookup found nothing: cost and tokens are real, the
+        # provider-side columns must read '-' instead of a zero that looks like a number.
+        with open(os.path.join(scratch, 'results', 'nolookup-model.jsonl'), 'w',
+                  encoding='utf-8') as f:
+            for row in fake_run_rows(4):
+                row['metrics'].update(latency_ms=0, generation_time_ms=0, providers=[])
+                f.write(json.dumps(row) + '\n')
         proc = subprocess.run([sys.executable, 'result.py'], cwd=scratch,
                               capture_output=True, text=True)
         check('result.py exit code', proc.returncode, 0)
@@ -357,6 +476,8 @@ def test_result_py_aggregates():
     check('Cost($)', fake['Cost($)'], '0.0186')      # 12*0.001 + 0.0001*66
     check('Infer(s)', fake['Infer(s)'], '186.0')     # 12*10 + 66
     check('Infer/q(s)', fake['Infer/q(s)'], '15.5')
+    check('Lat/q(ms)', fake['Lat/q(ms)'], '900')      # 12*900 / 12
+    check('Gen/q(s)', fake['Gen/q(s)'], '11.0')       # 12*11000ms / 12 / 1000
     check('PromptTok', fake['PromptTok'], '600066')
     check('ReasonTok', fake['ReasonTok'], '1440')
     check('CompTok', fake['CompTok'], '3600')
@@ -369,9 +490,17 @@ def test_result_py_aggregates():
           ['-'] * (len(USAGE_HEADER) - 1))
     check('usage table printed', 'USAGE' in proc.stdout, True)
 
+    nolookup = dict(zip(header, rows['nolookup-model']))
+    check('cost survives a failed lookup', nolookup['Cost($)'], '0.0046')  # 4*0.001 + 0.0006
+    check('wall-clock survives', nolookup['Infer(s)'], '46.0')            # 4*10 + 6
+    check('no provider -> -', nolookup['Provider'], '-')
+    check('no latency -> -', nolookup['Lat/q(ms)'], '-')
+    check('no generation time -> -', nolookup['Gen/q(s)'], '-')
+
 
 USAGE_HEADER = ["Model", "Provider", "Requests", "Cost($)", "Infer(s)", "Infer/q(s)",
-                "PromptTok", "ReasonTok", "CompTok", "TotalTok", "$/1M tok"]
+                "Lat/q(ms)", "Gen/q(s)", "PromptTok", "ReasonTok", "CompTok", "TotalTok",
+                "$/1M tok"]
 
 
 BANNER = """\

@@ -86,22 +86,30 @@ class GenerationStats:
     /api/v1/generation otherwise, so a run never hard-depends on the extra package.
     """
 
-    def __init__(self, api_key, retries=3):
+    def __init__(self, api_key, retries=4, timeout=30):
         self.api_key = api_key
         self.retries = retries
+        self.timeout = timeout
         self.client = None
         self.session = None
+        self.last_error = None  # why the most recent lookup came back empty
+        self.warned = False
         try:
             from openrouter import OpenRouter
             self.client = OpenRouter(api_key=api_key)
+        except Exception as e:
+            self.last_error = 'openrouter SDK not importable (%s)' % e
+        # The session is built either way, so a broken SDK can fall back to the documented
+        # GET rather than costing the run its provider and latency numbers.
+        try:
+            import requests
+            self.session = requests.Session()
         except Exception:
-            try:
-                import requests
-                self.session = requests.Session()
-            except Exception:
-                # Neither backend available: the lookup turns into a no-op rather than
-                # taking the run down over an optional metric.
-                print("No OpenRouter SDK or requests available; skipping generation stats.")
+            pass
+        if self.client is None and self.session is None:
+            # Neither backend available: the lookup turns into a no-op rather than taking
+            # the run down over an optional metric.
+            print("No OpenRouter SDK or requests available; skipping generation stats.")
 
     def close(self):
         for backend in (self.client, self.session):
@@ -114,54 +122,117 @@ class GenerationStats:
         """Return the normalized record, or {} if it never showed up. Never raises."""
         if not generation_id:
             return {}
+        if self.client is None and self.session is None:
+            return {}
+        self.last_error = None
         delay = 0.5
         for attempt in range(self.retries + 1):
             record, pending = self._fetch_once(generation_id)
             if record:
+                self.last_error = None
                 return {dest: record[src] for src, dest in GENERATION_FIELDS.items()
                         if record.get(src) is not None}
             # The record is written a moment after the completion returns, so a 404 right
             # after the call just means "not indexed yet" and is worth another look.
             if not pending or attempt == self.retries:
-                return {}
+                break
             time.sleep(delay)
             delay *= 2
+        self._warn_once(generation_id)
         return {}
 
+    def _warn_once(self, generation_id):
+        """Say why the lookup came back empty, once per process.
+
+        Swallowing the reason is worse than the missing metric: an empty provider and
+        latency column reads as "OpenRouter does not report these" when the real cause is
+        an error we hid.
+        """
+        if self.warned:
+            return
+        self.warned = True
+        print('No generation record for %s (%s). Provider name, provider-side latency and '
+              'native token counts stay missing for this run; cost and token counts still '
+              'come inline with each answer. Run "python misc/check_live_metrics.py" to see '
+              'the raw response, or pass --skip_gen_stats to stop looking.'
+              % (generation_id, self.last_error or 'no reason reported'))
+
     def _fetch_once(self, generation_id):
-        """-> (record dict or None, whether it is worth retrying)"""
-        if self.client is None and self.session is None:
-            return None, False
+        """-> (record dict or None, whether it is worth retrying)
+
+        The SDK is tried first when installed, then the documented GET. An SDK failure that
+        is not a plain 404 drops it for the rest of the process: /api/v1/generation serves
+        the same record, and the metric is worth more than the typed client.
+        """
         if self.client is not None:
-            try:
-                res = self.client.generations.get_generation(id=generation_id)
-            except Exception as e:
-                return None, 'notfound' in type(e).__name__.lower()
-            try:
-                raw = res.model_dump()
-            except Exception:
-                raw = res if isinstance(res, dict) else {}
-        else:
-            try:
-                resp = self.session.get(
-                    GENERATION_URL,
-                    params={'id': generation_id},
-                    headers={'Authorization': 'Bearer %s' % self.api_key},
-                    timeout=30,
-                )
-            except Exception:
-                return None, False
-            if resp.status_code == 404:
-                return None, True
-            if resp.status_code >= 400:
-                return None, False
-            try:
-                raw = resp.json()
-            except Exception:
-                return None, False
-        if not isinstance(raw, dict):
+            record, pending, usable = self._fetch_sdk(generation_id)
+            if usable:
+                return record, pending
+            print('The openrouter SDK lookup is unusable (%s); falling back to GET %s'
+                  % (self.last_error, GENERATION_URL))
+            self.client = None
+        if self.session is None:
             return None, False
-        return (raw.get('data') or raw), False
+        return self._fetch_http(generation_id)
+
+    def _fetch_sdk(self, generation_id):
+        """-> (record, worth retrying, whether this backend works at all)"""
+        try:
+            res = self.client.generations.get_generation(id=generation_id)
+        except Exception as e:
+            if 'notfound' in type(e).__name__.lower() or '404' in str(e):
+                self.last_error = 'the SDK reported 404 (not indexed yet)'
+                return None, True, True
+            self.last_error = 'the SDK raised %s: %s' % (type(e).__name__, e)
+            return None, False, False
+        try:
+            raw = res.model_dump()
+        except Exception:
+            raw = res if isinstance(res, dict) else None
+        if not isinstance(raw, dict):
+            self.last_error = ('the SDK returned %s, which is not a record'
+                               % type(res).__name__)
+            return None, False, False
+        record = raw.get('data') if isinstance(raw.get('data'), dict) else raw
+        if not record:
+            self.last_error = 'the SDK returned an empty record'
+            return None, False, False
+        return record, False, True
+
+    def _fetch_http(self, generation_id):
+        """-> (record dict or None, whether it is worth retrying)"""
+        try:
+            resp = self.session.get(
+                GENERATION_URL,
+                params={'id': generation_id},
+                headers={'Authorization': 'Bearer %s' % self.api_key},
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            self.last_error = 'GET %s failed: %s' % (GENERATION_URL, e)
+            return None, False
+        if resp.status_code == 404:
+            self.last_error = 'the endpoint answered 404 (not indexed yet)'
+            return None, True
+        if resp.status_code >= 400:
+            self.last_error = 'the endpoint answered HTTP %d: %s' % (
+                resp.status_code, (resp.text or '')[:200].strip())
+            return None, False
+        try:
+            raw = resp.json()
+        except Exception:
+            self.last_error = ('the endpoint answered 200 with a body that is not JSON: %s'
+                               % (resp.text or '')[:200].strip())
+            return None, False
+        if not isinstance(raw, dict):
+            self.last_error = 'the endpoint answered 200 with %s, not an object' % type(raw).__name__
+            return None, False
+        record = raw.get('data') if isinstance(raw.get('data'), dict) else raw
+        if not record:
+            self.last_error = ('the endpoint answered 200 with an empty record: %s'
+                               % json.dumps(raw)[:200])
+            return None, False
+        return record, False
 
 def summarize_calls(calls):
     """Roll the per-call records of one question up into the item's usage block."""
@@ -176,6 +247,10 @@ def summarize_calls(calls):
         'requests': len(calls),
         'failed_requests': sum(1 for call in calls if not call.get('ok')),
         'inference_time': round(total('inference_time'), 3),
+        # Provider-side timings, from the generation record: `latency` is OpenRouter's
+        # time-to-first-token, `generation_time` the generation itself. Both stay 0 when the
+        # lookup found nothing, which result.py renders as '-' rather than a real zero.
+        'latency_ms': round(total('latency_ms'), 1),
         'generation_time_ms': round(total('generation_time_ms'), 1),
         'cost': total('cost'),
         'prompt_tokens': total('prompt_tokens'),
