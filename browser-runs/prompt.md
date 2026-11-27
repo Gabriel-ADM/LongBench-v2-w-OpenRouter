@@ -1,5 +1,60 @@
 # **Gemini Prompt-Compression Benchmark**
 
+1. Proposed architecture
+Input dataset
+
+Google Sheets / JSON / Webhook / CSV
+
+
+JavaScript Benchmark Runner
+
+Node.js + Playwright or official Gemini API
+
+Original prompt
+Baseline
+
+Compressed prompts
+Independent variants
+
+
+
+Gemini execution
+
+One execution per prompt variant and test case
+
+
+Measurement and evaluation
+
+Latency, token count, output, errors, compression ratio, quality
+
+
+Results storage
+
+Google Sheets / JSON / Database / Webhook
+
+
+2. Experiment structure
+Each execution should generate an independent record.
+Field	Description
+experiment_id	Unique experiment identifier
+test_case_id	Input question identifier
+prompt_id	Original prompt identifier
+variant_id	Compression variant
+compression_method	Compression technique
+original_prompt	Original prompt
+modified_prompt	Compressed prompt
+input_data	Context and question
+started_at	Execution start timestamp
+finished_at	Execution completion timestamp
+latency_ms	Processing duration
+response	Gemini response
+error	Execution error
+input_tokens	Input token count, if available
+output_tokens	Output token count, if available
+evaluation_score	Quality evaluation
+
+The LongBench methodology you provided is a useful starting point: it separates input, context, answers, dataset and length, and uses automated prediction and evaluation stages.
+
 The implementation will use **Node.js + Playwright + JSONL**, with an existing Google account authenticated in a persistent Chromium browser profile.
 
 The benchmark will:
